@@ -857,12 +857,15 @@ impl MXFP4Layer {
                 let block_start = row * k_half + blk * half_block;
                 let blk_bytes = &blocks_data[block_start..block_start + half_block];
 
+                let mut block_dot = 0f32;
                 for byte_i in 0..half_block {
                     let packed = blk_bytes[byte_i];
                     let w0 = dequant[(packed & 0x0F) as usize];
                     let w1 = dequant[((packed >> 4) & 0x0F) as usize];
-                    dot += x_blk[byte_i * 2] * w0 + x_blk[byte_i * 2 + 1] * w1;
+                    block_dot += x_blk[byte_i * 2] * w0 + x_blk[byte_i * 2 + 1] * w1;
                 }
+                // Preserve the reference path's per-block accumulation order.
+                dot += block_dot;
             }
 
             if let Some(bias) = &bias_data {
@@ -1409,10 +1412,8 @@ mod tests {
         let serial_ms = serial_times[ITERATIONS / 2];
         let optimized_ms = optimized_times[ITERATIONS / 2];
         let bytes_per_expert = N * (K / 2 + K / MXFP4_BLOCK_SIZE);
-        let full_copy_mib =
-            (EXPERTS * bytes_per_expert) as f64 / (1024.0 * 1024.0);
-        let routed_copy_mib =
-            (TOPK * bytes_per_expert) as f64 / (1024.0 * 1024.0);
+        let full_copy_mib = (EXPERTS * bytes_per_expert) as f64 / (1024.0 * 1024.0);
+        let routed_copy_mib = (TOPK * bytes_per_expert) as f64 / (1024.0 * 1024.0);
         eprintln!(
             "MXFP4 CPU gather: serial_median_ms={serial_ms:.2}, optimized_median_ms={optimized_ms:.2}, speedup={:.2}x, copied_per_call={full_copy_mib:.1}MiB->{routed_copy_mib:.1}MiB",
             serial_ms / optimized_ms,
