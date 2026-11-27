@@ -19,6 +19,9 @@ pub(crate) mod ops;
 /// MXFP4 block size (32 elements per scale)
 pub const MXFP4_BLOCK_SIZE: usize = 32;
 
+// Avoid Rayon scheduling overhead for tiny routed projections.
+const CPU_MXFP4_PARALLEL_MIN_OUTPUTS: usize = 4096;
+
 pub(crate) const N_BITS: usize = 4;
 
 #[derive(Debug)]
@@ -761,6 +764,8 @@ impl MXFP4Layer {
     /// CPU MoE forward: blocked dequant per (token, expert) pair.
     /// Avoids dequantizing all experts, only touches the needed weight blocks.
     fn gather_forward_dequantize(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        use rayon::prelude::*;
+
         let x_dims = x.dims();
         let indices_dims = indices.dims();
 
@@ -771,15 +776,11 @@ impl MXFP4Layer {
         };
 
         let blocks_dims = self.blocks.dims();
+        let num_experts = blocks_dims[0];
         let n = blocks_dims[1];
         let k_half = k / 2;
         let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
         let half_block = MXFP4_BLOCK_SIZE / 2;
-
-        let blocks_cpu = self.blocks.to_device(&Device::Cpu)?;
-        let scales_cpu = self.scales.to_device(&Device::Cpu)?;
-        let blocks_data: Vec<u8> = blocks_cpu.flatten_all()?.to_vec1()?;
-        let scales_data: Vec<u8> = scales_cpu.flatten_all()?.to_vec1()?;
 
         let x_f32 = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
@@ -787,75 +788,106 @@ impl MXFP4Layer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data: Vec<u32> = indices_cpu.flatten_all()?.to_vec1()?;
 
+        // Materialize only experts selected by this routing step. The previous path copied
+        // every expert's packed weights and scales into temporary Vecs on every decode token.
+        // Narrow before moving to CPU so even a device fallback transfers only routed slices.
+        let mut loaded = vec![false; num_experts];
+        let mut expert_data: Vec<Option<(Vec<u8>, Vec<u8>)>> =
+            std::iter::repeat_with(|| None).take(num_experts).collect();
+        for &expert_id in &indices_data {
+            let expert_idx = expert_id as usize;
+            if expert_idx >= num_experts {
+                candle_core::bail!(
+                    "MXFP4 routed expert index {expert_idx} is out of range for {num_experts} experts"
+                );
+            }
+            if !loaded[expert_idx] {
+                let expert_blocks = self
+                    .blocks
+                    .narrow(0, expert_idx, 1)?
+                    .to_device(&Device::Cpu)?;
+                let expert_scales = self
+                    .scales
+                    .narrow(0, expert_idx, 1)?
+                    .to_device(&Device::Cpu)?;
+                expert_data[expert_idx] = Some((
+                    expert_blocks.flatten_all()?.to_vec1()?,
+                    expert_scales.flatten_all()?.to_vec1()?,
+                ));
+                loaded[expert_idx] = true;
+            }
+        }
+
         let bias_data: Option<Vec<f32>> = self
             .bias
             .as_ref()
-            .map(|b| {
-                b.to_dtype(DType::F32)?
+            .map(|bias| {
+                bias.to_dtype(DType::F32)?
                     .to_device(&Device::Cpu)?
                     .flatten_all()?
                     .to_vec1()
             })
             .transpose()?;
+        let bias_is_per_expert = self.bias.as_ref().is_some_and(|bias| bias.rank() == 2);
 
-        // output: [num_tokens * topk, n]
+        // Output is [num_tokens * topk, n]. Each element is independent, so decode
+        // can use all available CPU workers even when there is only one input token.
         let mut output = vec![0f32; num_tokens * topk * n];
+        let compute_output = |output_idx: usize, output_value: &mut f32| {
+            let out_row = output_idx / n;
+            let row = output_idx % n;
+            let expert_idx = indices_data[out_row] as usize;
+            let (blocks_data, scales_data) = expert_data[expert_idx]
+                .as_ref()
+                .expect("routed expert slices were loaded before compute");
 
-        for token_idx in 0..num_tokens {
-            for slot_idx in 0..topk {
-                let expert_idx = indices_data[token_idx * topk + slot_idx] as usize;
-                let out_row = token_idx * topk + slot_idx;
+            let x_offset = if x_has_topk {
+                out_row * k
+            } else {
+                (out_row / topk) * k
+            };
 
-                // Get input row
-                let x_offset = if x_has_topk {
-                    (token_idx * topk + slot_idx) * k
-                } else {
-                    token_idx * k
-                };
+            let mut dot = 0f32;
+            for blk in 0..num_blocks_per_row {
+                let col_start = blk * MXFP4_BLOCK_SIZE;
+                let x_blk =
+                    &x_data[x_offset + col_start..x_offset + col_start + MXFP4_BLOCK_SIZE];
+                let scale = scales_data[row * num_blocks_per_row + blk] as usize;
+                let dequant = &Self::DEQUANT_LUT[scale];
+                let block_start = row * k_half + blk * half_block;
+                let blk_bytes = &blocks_data[block_start..block_start + half_block];
 
-                // Blocked dequant + matmul for this (token, expert) pair
-                let expert_blocks_base = expert_idx * n * k_half;
-                let expert_scales_base = expert_idx * n * num_blocks_per_row;
-
-                for blk in 0..num_blocks_per_row {
-                    let col_start = blk * MXFP4_BLOCK_SIZE;
-
-                    // Load input block
-                    let x_blk =
-                        &x_data[x_offset + col_start..x_offset + col_start + MXFP4_BLOCK_SIZE];
-
-                    for row in 0..n {
-                        let scale = scales_data[expert_scales_base + row * num_blocks_per_row + blk]
-                            as usize;
-                        let dequant = &Self::DEQUANT_LUT[scale];
-                        let blk_bytes =
-                            &blocks_data[expert_blocks_base + row * k_half + blk * half_block..];
-
-                        let mut dot = 0f32;
-                        for byte_i in 0..half_block {
-                            let packed = blk_bytes[byte_i];
-                            let w0 = dequant[(packed & 0x0F) as usize];
-                            let w1 = dequant[((packed >> 4) & 0x0F) as usize];
-                            dot += x_blk[byte_i * 2] * w0 + x_blk[byte_i * 2 + 1] * w1;
-                        }
-                        output[out_row * n + row] += dot;
-                    }
-                }
-
-                // Add bias
-                if let Some(ref bias) = bias_data {
-                    let bias_offset = expert_idx * n;
-                    for row in 0..n {
-                        output[out_row * n + row] += bias[bias_offset + row];
-                    }
+                for byte_i in 0..half_block {
+                    let packed = blk_bytes[byte_i];
+                    let w0 = dequant[(packed & 0x0F) as usize];
+                    let w1 = dequant[((packed >> 4) & 0x0F) as usize];
+                    dot += x_blk[byte_i * 2] * w0 + x_blk[byte_i * 2 + 1] * w1;
                 }
             }
+
+            if let Some(bias) = &bias_data {
+                let bias_offset = if bias_is_per_expert { expert_idx * n } else { 0 };
+                dot += bias[bias_offset + row];
+            }
+            *output_value = dot;
+        };
+
+        if output.len() >= CPU_MXFP4_PARALLEL_MIN_OUTPUTS {
+            output
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, value)| compute_output(idx, value));
+        } else {
+            output
+                .iter_mut()
+                .enumerate()
+                .for_each(|(idx, value)| compute_output(idx, value));
         }
 
-        let result = Tensor::from_vec(output, (num_tokens * topk, n), &Device::Cpu)?
+        Tensor::from_vec(output, (num_tokens * topk, n), &Device::Cpu)?
             .to_device(x.device())?
-            .to_dtype(x.dtype())?;
-        result.reshape((num_tokens, topk, n))
+            .to_dtype(x.dtype())?
+            .reshape((num_tokens, topk, n))
     }
 }
 
@@ -1165,6 +1197,226 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("packed MXFP4 expert weights"));
         assert!(message.contains("does not support stacked expert gather"));
+        Ok(())
+    }
+
+    fn serial_gather_forward_reference(
+        layer: &MXFP4Layer,
+        x: &Tensor,
+        indices: &Tensor,
+    ) -> Result<Tensor> {
+        let x_dims = x.dims();
+        let indices_dims = indices.dims();
+        let (num_tokens, topk, k, x_has_topk) = if x_dims.len() == 2 {
+            (x_dims[0], indices_dims[1], x_dims[1], false)
+        } else {
+            (x_dims[0], x_dims[1], x_dims[2], true)
+        };
+        let blocks_dims = layer.blocks.dims();
+        let num_experts = blocks_dims[0];
+        let n = blocks_dims[1];
+        let k_half = k / 2;
+        let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
+        let half_block = MXFP4_BLOCK_SIZE / 2;
+
+        let blocks_cpu = layer.blocks.to_device(&Device::Cpu)?;
+        let scales_cpu = layer.scales.to_device(&Device::Cpu)?;
+        let blocks_data: Vec<u8> = blocks_cpu.flatten_all()?.to_vec1()?;
+        let scales_data: Vec<u8> = scales_cpu.flatten_all()?.to_vec1()?;
+        let x_f32 = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
+        let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
+        let indices_data: Vec<u32> = indices_cpu.flatten_all()?.to_vec1()?;
+        let bias_data: Option<Vec<f32>> = layer
+            .bias
+            .as_ref()
+            .map(|bias| {
+                bias.to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1()
+            })
+            .transpose()?;
+        let bias_is_per_expert = layer.bias.as_ref().is_some_and(|bias| bias.rank() == 2);
+
+        let mut output = vec![0f32; num_tokens * topk * n];
+        for token_idx in 0..num_tokens {
+            for slot_idx in 0..topk {
+                let out_row = token_idx * topk + slot_idx;
+                let expert_idx = indices_data[out_row] as usize;
+                assert!(expert_idx < num_experts);
+                let x_offset = if x_has_topk {
+                    out_row * k
+                } else {
+                    token_idx * k
+                };
+                let expert_blocks_base = expert_idx * n * k_half;
+                let expert_scales_base = expert_idx * n * num_blocks_per_row;
+
+                for blk in 0..num_blocks_per_row {
+                    let col_start = blk * MXFP4_BLOCK_SIZE;
+                    let x_blk =
+                        &x_data[x_offset + col_start..x_offset + col_start + MXFP4_BLOCK_SIZE];
+
+                    for row in 0..n {
+                        let scale =
+                            scales_data[expert_scales_base + row * num_blocks_per_row + blk]
+                                as usize;
+                        let dequant = &MXFP4Layer::DEQUANT_LUT[scale];
+                        let block_start =
+                            expert_blocks_base + row * k_half + blk * half_block;
+                        let blk_bytes = &blocks_data[block_start..block_start + half_block];
+                        let mut dot = 0f32;
+                        for byte_i in 0..half_block {
+                            let packed = blk_bytes[byte_i];
+                            dot += x_blk[byte_i * 2] * dequant[(packed & 0x0F) as usize]
+                                + x_blk[byte_i * 2 + 1]
+                                    * dequant[((packed >> 4) & 0x0F) as usize];
+                        }
+                        output[out_row * n + row] += dot;
+                    }
+                }
+
+                if let Some(bias) = &bias_data {
+                    let bias_offset = if bias_is_per_expert { expert_idx * n } else { 0 };
+                    for row in 0..n {
+                        output[out_row * n + row] += bias[bias_offset + row];
+                    }
+                }
+            }
+        }
+
+        Tensor::from_vec(output, (num_tokens * topk, n), &Device::Cpu)?
+            .to_device(x.device())?
+            .to_dtype(x.dtype())?
+            .reshape((num_tokens, topk, n))
+    }
+
+    fn gather_test_layer(
+        experts: usize,
+        n: usize,
+        k: usize,
+        per_expert_bias: bool,
+    ) -> Result<MXFP4Layer> {
+        let blocks = Tensor::from_vec(
+            (0..experts * n * (k / 2))
+                .map(|index| ((index * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>(),
+            (experts, n, k / 2),
+            &Device::Cpu,
+        )?;
+        let scales = Tensor::from_vec(
+            vec![127u8; experts * n * (k / MXFP4_BLOCK_SIZE)],
+            (experts, n, k / MXFP4_BLOCK_SIZE),
+            &Device::Cpu,
+        )?;
+        let bias = if per_expert_bias {
+            Some(Tensor::from_vec(
+                (0..experts * n)
+                    .map(|index| (index % 31) as f32 * 0.01)
+                    .collect::<Vec<_>>(),
+                (experts, n),
+                &Device::Cpu,
+            )?)
+        } else {
+            Some(Tensor::from_vec(
+                (0..n)
+                    .map(|index| (index % 17) as f32 * 0.01)
+                    .collect::<Vec<_>>(),
+                (n,),
+                &Device::Cpu,
+            )?)
+        };
+        Ok(MXFP4Layer::from_parts(blocks, scales, bias))
+    }
+
+    #[test]
+    fn cpu_mxfp4_gather_matches_serial_reference() -> Result<()> {
+        const K: usize = 64;
+        const N: usize = 2048;
+        let indices = Tensor::new(&[[1u32, 3u32]], &Device::Cpu)?;
+        let input = Tensor::from_vec(
+            (0..K).map(|index| (index as f32 % 13.0) / 7.0).collect::<Vec<_>>(),
+            (1, K),
+            &Device::Cpu,
+        )?;
+        let input_with_topk = Tensor::from_vec(
+            (0..2 * K)
+                .map(|index| (index as f32 % 19.0) / 11.0)
+                .collect::<Vec<_>>(),
+            (1, 2, K),
+            &Device::Cpu,
+        )?;
+
+        // Output size is 4096, exercising the Rayon path for a single-token decode.
+        for per_expert_bias in [false, true] {
+            let layer = gather_test_layer(4, N, K, per_expert_bias)?;
+            let actual = layer.gather_forward(&input, &indices)?;
+            let expected = serial_gather_forward_reference(&layer, &input, &indices)?;
+            assert_close(&actual, &expected, 1e-5)?;
+
+            let actual_topk = layer.gather_forward(&input_with_topk, &indices)?;
+            let expected_topk =
+                serial_gather_forward_reference(&layer, &input_with_topk, &indices)?;
+            assert_close(&actual_topk, &expected_topk, 1e-5)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual CPU microbenchmark; run with --ignored --nocapture"]
+    fn cpu_mxfp4_gather_benchmark() -> Result<()> {
+        const EXPERTS: usize = 32;
+        const N: usize = 2048;
+        const K: usize = 2048;
+        const TOPK: usize = 4;
+        const ITERATIONS: usize = 3;
+
+        let layer = MXFP4Layer::from_parts(
+            Tensor::from_vec(
+                vec![0x22u8; EXPERTS * N * (K / 2)],
+                (EXPERTS, N, K / 2),
+                &Device::Cpu,
+            )?,
+            Tensor::from_vec(
+                vec![127u8; EXPERTS * N * (K / MXFP4_BLOCK_SIZE)],
+                (EXPERTS, N, K / MXFP4_BLOCK_SIZE),
+                &Device::Cpu,
+            )?,
+            None,
+        );
+        let input = Tensor::ones((1, K), DType::F32, &Device::Cpu)?;
+        let indices = Tensor::new(&[[0u32, 7u32, 15u32, 31u32]], &Device::Cpu)?;
+
+        let reference = serial_gather_forward_reference(&layer, &input, &indices)?;
+        let optimized = layer.gather_forward(&input, &indices)?;
+        assert_close(&optimized, &reference, 1e-5)?;
+
+        let mut serial_times = Vec::with_capacity(ITERATIONS);
+        let mut optimized_times = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let _ = serial_gather_forward_reference(&layer, &input, &indices)?;
+            serial_times.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            let start = std::time::Instant::now();
+            let _ = layer.gather_forward(&input, &indices)?;
+            optimized_times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        serial_times.sort_by(f64::total_cmp);
+        optimized_times.sort_by(f64::total_cmp);
+
+        let serial_ms = serial_times[ITERATIONS / 2];
+        let optimized_ms = optimized_times[ITERATIONS / 2];
+        let bytes_per_expert = N * (K / 2 + K / MXFP4_BLOCK_SIZE);
+        let full_copy_mib =
+            (EXPERTS * bytes_per_expert) as f64 / (1024.0 * 1024.0);
+        let routed_copy_mib =
+            (TOPK * bytes_per_expert) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "MXFP4 CPU gather: serial_median_ms={serial_ms:.2}, optimized_median_ms={optimized_ms:.2}, speedup={:.2}x, copied_per_call={full_copy_mib:.1}MiB->{routed_copy_mib:.1}MiB",
+            serial_ms / optimized_ms,
+        );
         Ok(())
     }
 }
