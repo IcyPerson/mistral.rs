@@ -1,0 +1,41 @@
+name: MXFP4 CPU gather regression and microbenchmark
+
+on:
+  push:
+    branches:
+      - perf/mxfp4-cpu-gather-20261127
+  pull_request:
+    branches:
+      - master
+    paths:
+      - mistralrs-quant/src/mxfp4/mod.rs
+      - .github/workflows/mxfp4-cpu-gather.yml
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-gather:
+    name: CPU MXFP4 routed gather
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "120"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run quantization crate tests
+        run: cargo test --locked -p mistralrs-quant
+
+      - name: Benchmark CPU MXFP4 gather against the serial reference
+        run: cargo test --locked -p mistralrs-quant mxfp4::tests::cpu_mxfp4_gather_benchmark -- --ignored --nocapture
