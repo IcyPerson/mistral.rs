@@ -209,11 +209,7 @@ impl RoutedExperts<'_> {
 // materializing the full [tokens, topk, hidden] weighted tensor.
 const CPU_MOE_REDUCE_PARALLEL_MIN_OUTPUTS: usize = 16_384;
 
-fn topk_weight_reduce_cpu(
-    ys: &Tensor,
-    topk_weights: &Tensor,
-    dtype: DType,
-) -> Result<Tensor> {
+fn topk_weight_reduce_cpu(ys: &Tensor, topk_weights: &Tensor, dtype: DType) -> Result<Tensor> {
     use rayon::prelude::*;
 
     let (tokens, topk, hidden) = ys.dims3()?;
@@ -261,9 +257,13 @@ fn topk_weight_reduce_cpu(
     let ys_data = ys_values.get(ys_start..ys_end).ok_or_else(|| {
         candle_core::Error::Msg("MoE output storage is shorter than its tensor shape".to_string())
     })?;
-    let weights_data = weights_values.get(weights_start..weights_end).ok_or_else(|| {
-        candle_core::Error::Msg("MoE routing storage is shorter than its tensor shape".to_string())
-    })?;
+    let weights_data = weights_values
+        .get(weights_start..weights_end)
+        .ok_or_else(|| {
+            candle_core::Error::Msg(
+                "MoE routing storage is shorter than its tensor shape".to_string(),
+            )
+        })?;
 
     let mut output = vec![0f32; tokens * hidden];
     let reduce_element = |index: usize, value: &mut f32| {
