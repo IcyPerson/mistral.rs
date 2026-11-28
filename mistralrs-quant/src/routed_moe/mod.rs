@@ -1,4 +1,4 @@
-use candle_core::{DType, Module, Result, Tensor, D};
+use candle_core::{DType, Module, Result, Storage, Tensor, D};
 
 use crate::{
     GluActivationType, LoraExpertExecution, LoraExpertInputMode, LoraExpertProjection, QuantMethod,
@@ -204,6 +204,94 @@ impl RoutedExperts<'_> {
     }
 }
 
+// Keep the CPU reduction generic: every model and quantization format that reaches
+// RoutedExperts uses this path. Accumulate directly into [tokens, hidden] instead of
+// materializing the full [tokens, topk, hidden] weighted tensor.
+const CPU_MOE_REDUCE_PARALLEL_MIN_OUTPUTS: usize = 16_384;
+
+fn topk_weight_reduce_cpu(
+    ys: &Tensor,
+    topk_weights: &Tensor,
+    dtype: DType,
+) -> Result<Tensor> {
+    use rayon::prelude::*;
+
+    let (tokens, topk, hidden) = ys.dims3()?;
+    let (weight_tokens, weight_topk) = topk_weights.dims2()?;
+    if weight_tokens != tokens || weight_topk != topk {
+        candle_core::bail!(
+            "MoE output shape [tokens={tokens}, topk={topk}, hidden={hidden}] does not match routing weights [{weight_tokens}, {weight_topk}]"
+        );
+    }
+    if topk == 0 {
+        candle_core::bail!("MoE weighted reduction requires at least one routed expert");
+    }
+
+    // Conversion is a no-op for contiguous F32 CPU tensors. Lower-precision inputs
+    // are promoted once, matching the previous reduction's F32 accumulation.
+    let ys_f32 = ys.to_dtype(DType::F32)?.contiguous()?;
+    let weights_f32 = topk_weights.to_dtype(DType::F32)?.contiguous()?;
+    let (ys_storage, ys_layout) = ys_f32.storage_and_layout();
+    let (weights_storage, weights_layout) = weights_f32.storage_and_layout();
+
+    let Storage::Cpu(ys_cpu) = &*ys_storage else {
+        candle_core::bail!("CPU MoE weighted reduction expected CPU output storage");
+    };
+    let Storage::Cpu(weights_cpu) = &*weights_storage else {
+        candle_core::bail!("CPU MoE weighted reduction expected CPU routing storage");
+    };
+    let ys_values = ys_cpu.as_slice::<f32>()?;
+    let weights_values = weights_cpu.as_slice::<f32>()?;
+
+    let ys_len = tokens
+        .checked_mul(topk)
+        .and_then(|value| value.checked_mul(hidden))
+        .ok_or_else(|| candle_core::Error::Msg("MoE output size overflow".to_string()))?;
+    let weights_len = tokens
+        .checked_mul(topk)
+        .ok_or_else(|| candle_core::Error::Msg("MoE routing size overflow".to_string()))?;
+    let ys_start = ys_layout.start_offset();
+    let weights_start = weights_layout.start_offset();
+    let ys_end = ys_start
+        .checked_add(ys_len)
+        .ok_or_else(|| candle_core::Error::Msg("MoE output range overflow".to_string()))?;
+    let weights_end = weights_start
+        .checked_add(weights_len)
+        .ok_or_else(|| candle_core::Error::Msg("MoE routing range overflow".to_string()))?;
+    let ys_data = ys_values.get(ys_start..ys_end).ok_or_else(|| {
+        candle_core::Error::Msg("MoE output storage is shorter than its tensor shape".to_string())
+    })?;
+    let weights_data = weights_values.get(weights_start..weights_end).ok_or_else(|| {
+        candle_core::Error::Msg("MoE routing storage is shorter than its tensor shape".to_string())
+    })?;
+
+    let mut output = vec![0f32; tokens * hidden];
+    let reduce_element = |index: usize, value: &mut f32| {
+        let token = index / hidden;
+        let hidden_index = index % hidden;
+        let mut sum = 0f32;
+        for expert in 0..topk {
+            let source = (token * topk + expert) * hidden + hidden_index;
+            sum += ys_data[source] * weights_data[token * topk + expert];
+        }
+        *value = sum;
+    };
+
+    if topk > 1 && output.len() >= CPU_MOE_REDUCE_PARALLEL_MIN_OUTPUTS {
+        output
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| reduce_element(index, value));
+    } else {
+        output
+            .iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| reduce_element(index, value));
+    }
+
+    Tensor::from_vec(output, (tokens, hidden), ys.device())?.to_dtype(dtype)
+}
+
 fn topk_weight_reduce(ys: &Tensor, topk_weights: &Tensor, dtype: DType) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if ys.device().is_cuda()
@@ -222,6 +310,9 @@ fn topk_weight_reduce(ys: &Tensor, topk_weights: &Tensor, dtype: DType) -> Resul
             topk,
         )?
         .to_dtype(dtype);
+    }
+    if ys.device().is_cpu() {
+        return topk_weight_reduce_cpu(ys, topk_weights, dtype);
     }
     ys.to_dtype(DType::F32)?
         .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
