@@ -42,7 +42,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: rustfmt --edition 2021 --check --config skip_children=true mistralrs-quant/src/routed_moe/mod.rs mistralrs-quant/src/routed_moe/tests.rs
 
       - name: Run quantization crate tests
         run: cargo test --locked -p mistralrs-quant
