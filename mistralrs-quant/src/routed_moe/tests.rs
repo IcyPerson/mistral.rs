@@ -331,8 +331,8 @@ fn cpu_weighted_reduce_benchmark() -> Result<()> {
 
         let baseline_median = baseline_ms[ITERATIONS / 2];
         let optimized_median = optimized_ms[ITERATIONS / 2];
-        let intermediate_mib = (tokens * topk * hidden * std::mem::size_of::<f32>()) as f64
-            / (1024.0 * 1024.0);
+        let intermediate_mib =
+            (tokens * topk * hidden * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0);
         eprintln!(
             "Generic CPU MoE weighted reduce ({label}): baseline_median_ms={baseline_median:.3}, optimized_median_ms={optimized_median:.3}, speedup={:.2}x, avoided_intermediate={intermediate_mib:.2}MiB",
             baseline_median / optimized_median,
