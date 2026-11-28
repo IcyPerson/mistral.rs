@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::Linear;
 use float8::F8E4M3;
 
@@ -198,5 +198,151 @@ fn routed_stats_on_up_projection_disable_fusion() -> Result<()> {
         },
     )?;
     assert_eq!(up.stats_snapshot(), Some((1, 2)));
+    Ok(())
+}
+
+
+fn assert_tensors_close(actual: &Tensor, expected: &Tensor, tolerance: f32) -> Result<()> {
+    let actual = actual
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let expected = expected
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual}, tolerance {tolerance}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cpu_weighted_reduce_matches_tensor_reference_across_dtypes_and_layouts() -> Result<()> {
+    let device = Device::Cpu;
+    let (tokens, topk, hidden) = (3, 4, 128);
+    let values = (0..tokens * topk * hidden)
+        .map(|index| ((index * 17 % 101) as f32 - 50.0) / 37.0)
+        .collect::<Vec<_>>();
+    let contiguous = Tensor::from_vec(values.clone(), (tokens, topk, hidden), &device)?;
+
+    // Build the same logical [tokens, topk, hidden] tensor with a transposed
+    // backing layout to exercise the generic helper's contiguous fallback.
+    let mut transposed_values = vec![0f32; tokens * hidden * topk];
+    for token in 0..tokens {
+        for expert in 0..topk {
+            for feature in 0..hidden {
+                transposed_values[(token * hidden + feature) * topk + expert] =
+                    values[(token * topk + expert) * hidden + feature];
+            }
+        }
+    }
+    let transposed = Tensor::from_vec(
+        transposed_values,
+        (tokens, hidden, topk),
+        &device,
+    )?
+    .transpose(1, 2)?;
+
+    let routing = Tensor::from_vec(
+        (0..tokens * topk)
+            .map(|index| (index % 7 + 1) as f32 / 16.0)
+            .collect::<Vec<_>>(),
+        (tokens, topk),
+        &device,
+    )?;
+
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for ys_f32 in [&contiguous, &transposed] {
+            let ys = ys_f32.to_dtype(dtype)?;
+            let expected = ys
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&routing.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)?
+                .to_dtype(dtype)?;
+            let actual = topk_weight_reduce(&ys, &routing, dtype)?;
+
+            assert_eq!(actual.dims(), &[tokens, hidden]);
+            assert_eq!(actual.dtype(), dtype);
+            let tolerance = match dtype {
+                DType::F32 => 1e-5,
+                DType::F16 => 1e-3,
+                DType::BF16 => 5e-3,
+                _ => unreachable!(),
+            };
+            assert_tensors_close(&actual, &expected, tolerance)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual generic CPU MoE weighted-reduction benchmark"]
+fn cpu_weighted_reduce_benchmark() -> Result<()> {
+    const WARMUP: usize = 5;
+    const ITERATIONS: usize = 15;
+    let device = Device::Cpu;
+
+    for (label, tokens, topk, hidden) in [
+        ("decode", 1usize, 4usize, 4096usize),
+        ("prefill", 64usize, 4usize, 4096usize),
+    ] {
+        let ys = Tensor::from_vec(
+            (0..tokens * topk * hidden)
+                .map(|index| ((index * 13 % 97) as f32 - 48.0) / 31.0)
+                .collect::<Vec<_>>(),
+            (tokens, topk, hidden),
+            &device,
+        )?;
+        let routing = Tensor::from_vec(
+            (0..tokens * topk)
+                .map(|index| (index % topk + 1) as f32 / 10.0)
+                .collect::<Vec<_>>(),
+            (tokens, topk),
+            &device,
+        )?;
+
+        let baseline = || {
+            ys.to_dtype(DType::F32)?
+                .broadcast_mul(&routing.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)
+        };
+        let reference = baseline()?;
+        let optimized = topk_weight_reduce(&ys, &routing, DType::F32)?;
+        assert_tensors_close(&optimized, &reference, 1e-5)?;
+
+        for _ in 0..WARMUP {
+            std::hint::black_box(baseline()?);
+            std::hint::black_box(topk_weight_reduce(&ys, &routing, DType::F32)?);
+        }
+
+        let mut baseline_ms = Vec::with_capacity(ITERATIONS);
+        let mut optimized_ms = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            std::hint::black_box(baseline()?);
+            baseline_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            let start = std::time::Instant::now();
+            std::hint::black_box(topk_weight_reduce(&ys, &routing, DType::F32)?);
+            optimized_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        baseline_ms.sort_by(f64::total_cmp);
+        optimized_ms.sort_by(f64::total_cmp);
+
+        let baseline_median = baseline_ms[ITERATIONS / 2];
+        let optimized_median = optimized_ms[ITERATIONS / 2];
+        let intermediate_mib =
+            (tokens * topk * hidden * std::mem::size_of::<f32>()) as f64
+                / (1024.0 * 1024.0);
+        eprintln!(
+            "Generic CPU MoE weighted reduce ({label}): baseline_median_ms={baseline_median:.3}, optimized_median_ms={optimized_median:.3}, speedup={:.2}x, avoided_intermediate={intermediate_mib:.2}MiB",
+            baseline_median / optimized_median,
+        );
+    }
     Ok(())
 }
