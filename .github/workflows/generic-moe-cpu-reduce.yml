@@ -1,0 +1,54 @@
+name: Generic CPU MoE weighted-reduction regression and benchmark
+
+on:
+  push:
+    branches:
+      - perf/generic-moe-cpu-reduce-20261128
+  pull_request:
+    branches:
+      - master
+    paths:
+      - mistralrs-quant/src/routed_moe/mod.rs
+      - mistralrs-quant/src/routed_moe/tests.rs
+      - .github/workflows/generic-moe-cpu-reduce.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generic-moe-cpu-reduce-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-moe-reduce:
+    name: Generic CPU MoE weighted reduction
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: ""
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "120"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run quantization crate tests
+        run: cargo test --locked -p mistralrs-quant
+
+      - name: Run quantization crate Clippy
+        run: cargo clippy --locked -p mistralrs-quant --all-targets -- -D warnings
+
+      - name: Benchmark generic CPU MoE weighted reduction
+        run: cargo test --locked -p mistralrs-quant routed_moe::tests::cpu_weighted_reduce_benchmark -- --ignored --nocapture
